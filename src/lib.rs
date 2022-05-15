@@ -1,28 +1,32 @@
 //! This crate provides the struct [`Lineage<T>`], which is a cell that allows replacing the contained
-//! value while the previous value is still immutably borrowed. This is safe because old values are
-//! stored and not dropped until [`cleared`][Lineage::clear]. Useful to safely implemet bump allocators.
+//! value while the previous value is still borrowed. This is safe because the old values are stored and
+//! only dropped at a later time. Useful to safely implement bump allocators.
 //!
 //! ```
 //! # use lineage::Lineage;
 //! let lineage: Lineage<[u32; 3]> = Lineage::new([1, 2, 3]);
 //! let s1: &[u32] = lineage.get();
 //!
-//! lineage.replace([4, 5, 6]);
+//! lineage.set([4, 5, 6]);
 //! let s2: &[u32] = lineage.get();
 //!
 //! assert_eq!(s1, &[1, 2, 3]);
 //! assert_eq!(s2, &[4, 5, 6]);
 //! ```
 
-use std::cell::RefCell;
-use std::fmt;
-use std::ptr::NonNull;
+use std::{fmt, marker::PhantomData, sync::atomic::AtomicPtr, sync::atomic::Ordering};
 
-/// A type of cell that allows replacing the contained value while borrowed.
+use smallvec::SmallVec;
+use usync::Mutex;
+
+/// A type of cell that allows replacing the contained value without invalidating existing references.
 #[derive()]
 pub struct Lineage<T> {
-    current: RefCell<Box<T>>,
-    past: RefCell<Vec<Box<T>>>,
+    current: AtomicPtr<T>,
+    past: Mutex<SmallVec<[Box<T>; 1]>>,
+
+    // this field ensures that Lineage<T> is only Sync if T is Sync
+    _t: PhantomData<T>,
 }
 
 impl<T> fmt::Debug for Lineage<T>
@@ -30,60 +34,90 @@ where
     T: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let current: &T = &self.current.borrow();
-
-        f.debug_struct("Lineage").field("current", current).finish()
+        f.debug_struct("Lineage")
+            .field("current", self.get())
+            .finish()
     }
 }
 
 impl<T> Lineage<T> {
     /// Create a new lineage with the specified starting value.
     pub fn new(value: T) -> Self {
+        let mut value = Box::new(value);
+        let ptr = value.as_mut() as *mut T;
+
         Lineage {
-            current: RefCell::new(Box::new(value)),
-            past: RefCell::new(Vec::new()),
+            current: AtomicPtr::new(ptr),
+            past: Mutex::new(SmallVec::from_iter([value])),
+            _t: PhantomData,
         }
     }
 
-    /// Borrow the current value.
+    /// Get a reference to the current value.
     pub fn get(&self) -> &T {
-        unsafe {
-            // we borrow the current value for the lifetime of "&self" without locking the refcell. this
-            // is clearly dangerous, because the refcell allows us to mutate and drop its content, which
-            // we must now avoid doing.
-            //
-            // the only function that mutably accesses the refcell is "self.replace()". this function
-            // swaps the value with a replacement, but it stores the previous value in "self.past".
-            // references to the old value are therefor still valid.
-            //
-            // we are allowed to mutate the refcell in "self.clear" and "self.get_mut" because these
-            // functions take "&mut self". this proves that self is no longer immutably borrowed.
+        let ptr = self.current.load(Ordering::Relaxed);
 
-            NonNull::new(&mut self.current.borrow()).unwrap().as_ref()
+        unsafe {
+            // converting the pointer to a &T is safe. the pointer is properly aligned and initialized
+            // because it was created from a Box<T>. the pointer is still valid because the box is stored
+            // in self.past and will not be dropped while self.current is still pointing to its contents.
+            //
+            // the chosen lifetime is the lifetime of &self. this means we must ensure the reference
+            // remains valid while &self is borrowed. we achieve this by not dropping the Box<T> which
+            // owns the referenced value until wither self is dropped, or self.clear is called. in both
+            // cases &self is no longer borrowed.
+
+            ptr.as_ref()
         }
+        .unwrap()
     }
 
-    /// Borrow the current value mutably.
+    /// Get a mutable reference to the current value.
     pub fn get_mut(&mut self) -> &mut T {
-        self.current.get_mut()
+        let ptr = self.current.load(Ordering::Relaxed);
+
+        unsafe {
+            // converting the pointer to a &mut T is safe. the pointer is properly aligned and initialized
+            // because it was created from a Box<T>.
+
+            ptr.as_mut()
+        }
+        .unwrap()
     }
 
     /// Replace the contained value.
     ///
-    /// Replacing the value does not invalidate immutable borrows to the previous value. The replaced
+    /// Replacing the value does not invalidate existing references to the previous value. The previous
     /// value is kept alive until you call [`clear`][Lineage::clear].
-    pub fn replace(&self, value: T) {
-        self.past
-            .borrow_mut()
-            .push(self.current.replace(Box::new(value)));
+    pub fn set(&self, value: T) {
+        let mut value = Box::new(value);
+        let ptr = value.as_mut() as *mut T;
+
+        let mut past = self.past.lock();
+        past.push(value);
+
+        self.current.store(ptr, Ordering::Release);
     }
 
-    /// Clear out old replaced values. Does not affect the current value.
+    /// Clear all replaced values. Does not affect the current value.
     ///
-    /// This can only be called if no borrows to previous values exist anymore. This is ensured by the
-    /// `&mut self` requirement.
+    /// This can only be called if no references to any of the previous values exist anymore. This is
+    /// ensured by the `&mut self` requirement.
     pub fn clear(&mut self) -> impl '_ + Iterator<Item = T> + ExactSizeIterator {
-        self.past.get_mut().drain(..).rev().map(|entry| *entry)
+        let past = self.past.get_mut();
+
+        {
+            // let's verify that self.current is pointing to the last entry in self.past. all other
+            // entries will be dropped and must not be pointed to.
+
+            assert_eq!(
+                self.current.load(Ordering::Acquire),
+                past.last_mut().unwrap().as_mut() as *mut T
+            );
+        }
+
+        let len = past.len();
+        past.drain(0..len - 1).rev().map(|entry| *entry)
     }
 }
 
@@ -92,10 +126,7 @@ where
     T: Clone,
 {
     fn clone(&self) -> Self {
-        Lineage {
-            current: self.current.clone(),
-            past: RefCell::new(Vec::new()),
-        }
+        Lineage::new(self.get().clone())
     }
 }
 
@@ -104,9 +135,12 @@ where
     T: Default,
 {
     fn default() -> Self {
-        Lineage {
-            current: RefCell::new(Default::default()),
-            past: RefCell::new(Vec::new()),
-        }
+        Lineage::new(T::default())
+    }
+}
+
+impl<T> From<T> for Lineage<T> {
+    fn from(value: T) -> Self {
+        Lineage::new(value)
     }
 }
