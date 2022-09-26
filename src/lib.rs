@@ -1,88 +1,75 @@
 //! This crate provides the struct [`Lineage<T>`], which is a cell that allows replacing the contained
 //! value while the previous value is still borrowed. This is safe because the old values are stored and
-//! only dropped at a later time. Useful to safely implement bump allocators.
-//!
-//! ```
-//! # use lineage::Lineage;
-//! let lineage: Lineage<[u32; 3]> = Lineage::new([1, 2, 3]);
-//! let s1: &[u32] = lineage.get();
-//!
-//! lineage.set([4, 5, 6]);
-//! let s2: &[u32] = lineage.get();
-//!
-//! assert_eq!(s1, &[1, 2, 3]);
-//! assert_eq!(s2, &[4, 5, 6]);
-//! ```
+//! only dropped at a later time.
 
-use std::{fmt, marker::PhantomData, sync::atomic::AtomicPtr, sync::atomic::Ordering};
+mod arrayvec;
+use arrayvec::ArrayVec;
 
-use smallvec::SmallVec;
-use usync::Mutex;
+use std::{
+    fmt, marker::PhantomData, ptr, sync::atomic::AtomicPtr, sync::atomic::Ordering, sync::Mutex,
+};
 
-/// A type of cell that allows replacing the contained value without invalidating existing references.
+use static_assertions::assert_not_impl_any;
+
+/// A type of cell that allows replacing the contained value without invalidating references to
+/// the previous value.
+///
+/// The optional const generic `N` specifies how many values can be stored inline. Defaults to `1`,
+/// which means creating a lineage with `Lineage::new(value)` does not perform any heap allocations.
+/// Replacing the value will however cause a heap allocation because new values will be stored in a
+/// `Vec<Box<T>>`. The const generic `N` can be set to a higher value to allow for multiple replacings
+/// of the value before needing a `Vec<Box<T>>`.
 #[derive()]
-pub struct Lineage<T> {
+pub struct Lineage<T, const N: usize = 1> {
     current: AtomicPtr<T>,
-    past: Mutex<SmallVec<[Box<T>; 1]>>,
-
-    // this field ensures that Lineage<T> is only Sync if T is Sync
+    past: Mutex<(ArrayVec<T, N>, Vec<Box<T>>)>,
     _t: PhantomData<T>,
 }
 
-impl<T> fmt::Debug for Lineage<T>
+assert_not_impl_any!(Lineage<std::cell::Cell<usize>>: Sync);
+assert_not_impl_any!(Lineage<std::rc::Rc<usize>>: Send, Sync);
+
+impl<T, const N: usize> fmt::Debug for Lineage<T, N>
 where
     T: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Lineage")
-            .field("current", self.get())
-            .finish()
+        f.debug_tuple("Lineage").field(self.get()).finish()
     }
 }
 
-impl<T> Lineage<T> {
-    /// Create a new lineage with the specified starting value.
+impl<T, const N: usize> Lineage<T, N> {
+    /// Create a new lineage with the specified value.
     pub fn new(value: T) -> Self {
-        let mut value = Box::new(value);
-        let ptr = value.as_mut() as *mut T;
-
-        Lineage {
-            current: AtomicPtr::new(ptr),
-            past: Mutex::new(SmallVec::from_iter([value])),
+        let mut ret = Lineage {
+            current: AtomicPtr::new(ptr::null_mut()),
+            past: Mutex::new((ArrayVec::new(), Vec::new())),
             _t: PhantomData,
-        }
+        };
+        ret.set_mut(value);
+
+        ret
     }
 
     /// Get a reference to the current value.
     pub fn get(&self) -> &T {
-        let ptr = self.current.load(Ordering::Relaxed);
-
         unsafe {
-            // converting the pointer to a &T is safe. the pointer is properly aligned and initialized
-            // because it was created from a Box<T>. the pointer is still valid because the box is stored
-            // in self.past and will not be dropped while self.current is still pointing to its contents.
             //
-            // the chosen lifetime is the lifetime of &self. this means we must ensure the reference
-            // remains valid while &self is borrowed. we achieve this by not dropping the Box<T> which
-            // owns the referenced value until wither self is dropped, or self.clear is called. in both
-            // cases &self is no longer borrowed.
 
-            ptr.as_ref()
+            self.current
+                .load(Ordering::Acquire)
+                .as_ref()
+                .unwrap_unchecked()
         }
-        .unwrap()
     }
 
     /// Get a mutable reference to the current value.
     pub fn get_mut(&mut self) -> &mut T {
-        let ptr = self.current.load(Ordering::Relaxed);
-
         unsafe {
-            // converting the pointer to a &mut T is safe. the pointer is properly aligned and initialized
-            // because it was created from a Box<T>.
+            //
 
-            ptr.as_mut()
+            self.current.get_mut().as_mut().unwrap_unchecked()
         }
-        .unwrap()
     }
 
     /// Replace the contained value.
@@ -90,38 +77,86 @@ impl<T> Lineage<T> {
     /// Replacing the value does not invalidate existing references to the previous value. The previous
     /// value is kept alive until you call [`clear`][Lineage::clear].
     pub fn set(&self, value: T) {
-        let mut value = Box::new(value);
-        let ptr = value.as_mut() as *mut T;
+        let past: &mut (_, _) = &mut self.past.lock().unwrap();
 
-        let mut past = self.past.lock();
-        past.push(value);
+        let ptr = match past.0.try_push(value) {
+            None => past.0.last_mut().unwrap() as *mut T,
+            Some(value) => {
+                let mut value = Box::new(value);
+                let ptr = value.as_mut() as *mut T;
+                past.1.push(value);
 
+                ptr
+            }
+        };
         self.current.store(ptr, Ordering::Release);
     }
 
-    /// Clear all replaced values. Does not affect the current value.
+    /// Replace the contained value.
+    ///
+    /// Performs better than [`set`][Lineage::set] and drops old values similar to
+    /// [`clear`][Lineage::clear] but can only be called on `&mut self`.
+    pub fn set_mut(&mut self, value: T) {
+        let past = self.past.get_mut().unwrap();
+
+        past.0.clear();
+        past.1.clear();
+        let ptr = match past.0.try_push(value) {
+            None => past.0.last_mut().unwrap() as *mut T,
+            Some(value) => {
+                let mut value = Box::new(value);
+                let ptr = value.as_mut() as *mut T;
+                past.1.push(value);
+
+                ptr
+            }
+        };
+        *self.current.get_mut() = ptr;
+    }
+
+    /// Drop all past values. Does not affect the current value.
     ///
     /// This can only be called if no references to any of the previous values exist anymore. This is
     /// ensured by the `&mut self` requirement.
-    pub fn clear(&mut self) -> impl '_ + Iterator<Item = T> + ExactSizeIterator {
-        let past = self.past.get_mut();
+    pub fn clear(&mut self) {
+        let past = self.past.get_mut().unwrap();
 
+        if (N == 0 && past.1.len() == 1)
+            || (N == 1 && past.1.len() == 0)
+            || (N > 1 && past.0.len() == 1)
         {
-            // let's verify that self.current is pointing to the last entry in self.past. all other
-            // entries will be dropped and must not be pointed to.
-
-            assert_eq!(
-                self.current.load(Ordering::Acquire),
-                past.last_mut().unwrap().as_mut() as *mut T
-            );
+            return;
         }
 
-        let len = past.len();
-        past.drain(0..len - 1).rev().map(|entry| *entry)
+        if N == 0 {
+            let current: Box<T> = past.1.pop().unwrap();
+
+            past.1.clear();
+            past.1.push(current);
+        } else {
+            let current: T = if let Some(current) = past.1.pop() {
+                *current
+            } else {
+                past.0.pop().unwrap()
+            };
+
+            self.set_mut(current);
+        }
+    }
+
+    /// Return ownership of the current value.
+    pub fn into_inner(mut self) -> T {
+        let past = self.past.get_mut().unwrap();
+
+        if let Some(current) = past.1.pop() {
+            *current
+        } else {
+            past.0.pop().unwrap()
+        }
     }
 }
 
-impl<T> Clone for Lineage<T>
+impl<T, const N: usize> Clone for Lineage<T, N>
 where
     T: Clone,
 {
@@ -130,7 +165,7 @@ where
     }
 }
 
-impl<T> Default for Lineage<T>
+impl<T, const N: usize> Default for Lineage<T, N>
 where
     T: Default,
 {
@@ -139,7 +174,7 @@ where
     }
 }
 
-impl<T> From<T> for Lineage<T> {
+impl<T, const N: usize> From<T> for Lineage<T, N> {
     fn from(value: T) -> Self {
         Lineage::new(value)
     }
