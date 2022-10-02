@@ -6,7 +6,8 @@ mod arrayvec;
 use arrayvec::ArrayVec;
 
 use std::{
-    fmt, marker::PhantomData, ptr, sync::atomic::AtomicPtr, sync::atomic::Ordering, sync::Mutex,
+    fmt, marker::PhantomData, ptr, sync::atomic::AtomicIsize, sync::atomic::AtomicPtr,
+    sync::atomic::Ordering, sync::Mutex,
 };
 
 use static_assertions::assert_not_impl_any;
@@ -21,7 +22,7 @@ use static_assertions::assert_not_impl_any;
 /// of the value before needing a `Vec<Box<T>>`.
 #[derive()]
 pub struct Lineage<T, const N: usize = 1> {
-    current: AtomicPtr<T>,
+    current: (AtomicIsize, AtomicPtr<T>),
     past: Mutex<(ArrayVec<T, N>, Vec<Box<T>>)>,
     _t: PhantomData<T>,
 }
@@ -42,7 +43,7 @@ impl<T, const N: usize> Lineage<T, N> {
     /// Create a new lineage with the specified value.
     pub fn new(value: T) -> Self {
         let mut ret = Lineage {
-            current: AtomicPtr::new(ptr::null_mut()),
+            current: (AtomicIsize::new(0), AtomicPtr::new(ptr::null_mut())),
             past: Mutex::new((ArrayVec::new(), Vec::new())),
             _t: PhantomData,
         };
@@ -54,21 +55,26 @@ impl<T, const N: usize> Lineage<T, N> {
     /// Get a reference to the current value.
     pub fn get(&self) -> &T {
         unsafe {
-            //
+            let mut ptr = self.current.1.load(Ordering::Acquire);
+            if ptr.is_null() {
+                ptr = (self as *const Lineage<T, N> as *const u8)
+                    .offset(self.current.0.load(Ordering::Acquire)) as *mut T;
+            }
 
-            self.current
-                .load(Ordering::Acquire)
-                .as_ref()
-                .unwrap_unchecked()
+            ptr.as_ref().unwrap_unchecked()
         }
     }
 
     /// Get a mutable reference to the current value.
     pub fn get_mut(&mut self) -> &mut T {
         unsafe {
-            //
+            let mut ptr = *self.current.1.get_mut();
+            if ptr.is_null() {
+                ptr = (self as *const Lineage<T, N> as *const u8).offset(*self.current.0.get_mut())
+                    as *mut T;
+            }
 
-            self.current.get_mut().as_mut().unwrap_unchecked()
+            ptr.as_mut().unwrap()
         }
     }
 
@@ -77,19 +83,27 @@ impl<T, const N: usize> Lineage<T, N> {
     /// Replacing the value does not invalidate existing references to the previous value. The previous
     /// value is kept alive until you call [`clear`][Lineage::clear].
     pub fn set(&self, value: T) {
-        let past: &mut (_, _) = &mut self.past.lock().unwrap();
+        unsafe {
+            let past: &mut (_, _) = &mut self.past.lock().unwrap();
 
-        let ptr = match past.0.try_push(value) {
-            None => past.0.last_mut().unwrap() as *mut T,
-            Some(value) => {
-                let mut value = Box::new(value);
-                let ptr = value.as_mut() as *mut T;
-                past.1.push(value);
+            match past.0.try_push(value) {
+                None => {
+                    self.current.0.store(
+                        (past.0.last_mut().unwrap() as *const T as *const u8)
+                            .offset_from(self as *const Lineage<T, N> as *const u8),
+                        Ordering::Release,
+                    );
+                }
+                Some(value) => {
+                    let mut value = Box::new(value);
 
-                ptr
-            }
-        };
-        self.current.store(ptr, Ordering::Release);
+                    self.current
+                        .1
+                        .store(value.as_mut() as *mut T, Ordering::Release);
+                    past.1.push(value);
+                }
+            };
+        }
     }
 
     /// Replace the contained value.
@@ -97,21 +111,26 @@ impl<T, const N: usize> Lineage<T, N> {
     /// Performs better than [`set`][Lineage::set] and drops old values similar to
     /// [`clear`][Lineage::clear] but can only be called on `&mut self`.
     pub fn set_mut(&mut self, value: T) {
-        let past = self.past.get_mut().unwrap();
+        unsafe {
+            let self_ptr = self as *const Lineage<T, N>;
+            let past = self.past.get_mut().unwrap();
 
-        past.0.clear();
-        past.1.clear();
-        let ptr = match past.0.try_push(value) {
-            None => past.0.last_mut().unwrap() as *mut T,
-            Some(value) => {
-                let mut value = Box::new(value);
-                let ptr = value.as_mut() as *mut T;
-                past.1.push(value);
+            past.0.clear();
+            past.1.clear();
+            match past.0.try_push(value) {
+                None => {
+                    *self.current.0.get_mut() = (past.0.last_mut().unwrap() as *const T
+                        as *const u8)
+                        .offset_from(self_ptr as *const u8);
+                }
+                Some(value) => {
+                    let mut value = Box::new(value);
 
-                ptr
+                    *self.current.1.get_mut() = value.as_mut() as *mut T;
+                    past.1.push(value);
+                }
             }
-        };
-        *self.current.get_mut() = ptr;
+        }
     }
 
     /// Drop all past values. Does not affect the current value.
@@ -140,6 +159,7 @@ impl<T, const N: usize> Lineage<T, N> {
                 past.0.pop().unwrap()
             };
 
+            *self.current.1.get_mut() = ptr::null_mut();
             self.set_mut(current);
         }
     }
