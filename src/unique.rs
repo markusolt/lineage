@@ -2,7 +2,7 @@ use std::{fmt, marker::PhantomData, mem, ptr::NonNull};
 
 pub struct Unique<T> {
     ptr: NonNull<T>,
-    _t: PhantomData<T>,
+    _p: PhantomData<T>,
 }
 
 impl<T> Drop for Unique<T> {
@@ -31,7 +31,7 @@ impl<T> Unique<T> {
         unsafe {
             Unique {
                 ptr: NonNull::new_unchecked(Box::into_raw(Box::new(value))),
-                _t: PhantomData,
+                _p: PhantomData,
             }
         }
     }

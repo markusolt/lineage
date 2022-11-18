@@ -69,31 +69,34 @@ where
 impl<T, const N: usize> Lineage<T, N> {
     /// Create a new `Lineage` with the provided value.
     pub fn new(value: T) -> Self {
-        let mut ret = Lineage {
-            ptr_heap: AtomicPtr::new(ptr::null_mut()),
-            ptr_local: AtomicUsize::new(0),
-            inline: UnsafeCell::new([(); N].map(|_| MaybeUninit::uninit())),
-            mutex: Mutex::new((0, None)),
-            _t: PhantomData,
-        };
+        unsafe {
+            let mut ret = Lineage {
+                ptr_heap: AtomicPtr::new(ptr::null_mut()),
+                ptr_local: AtomicUsize::new(0),
+                inline: UnsafeCell::new([(); N].map(|_| MaybeUninit::uninit())),
+                mutex: Mutex::new((0, None)),
+                _t: PhantomData,
+            };
 
-        {
-            let (inline_len, head) = ret.mutex.get_mut().unwrap();
-            let inline = ret.inline.get_mut();
+            {
+                let (inline_len, head) = ret.mutex.get_mut().unwrap_unchecked();
+                let inline = ret.inline.get_mut();
 
-            if N > 0 {
-                inline[0].write(value);
-                *inline_len = 1;
+                if N > 0 {
+                    inline[0].write(value);
+                    *inline_len = 1;
 
-                *ret.ptr_local.get_mut() = 0;
-            } else {
-                *head = Some(Unique::new(Node { value, prev: None }));
+                    *ret.ptr_local.get_mut() = 0;
+                } else {
+                    *head = Some(Unique::new(Node { value, prev: None }));
 
-                *ret.ptr_heap.get_mut() = addr_of_mut!(head.as_mut().unwrap().get_mut().value);
+                    *ret.ptr_heap.get_mut() =
+                        addr_of_mut!(head.as_mut().unwrap_unchecked().get_mut().value);
+                }
             }
-        }
 
-        ret
+            ret
+        }
     }
 
     /// Get a reference to the current value.
@@ -127,6 +130,7 @@ impl<T, const N: usize> Lineage<T, N> {
 
                 debug_assert!(N > 0);
                 debug_assert!(ptr_local < N);
+                debug_assert!(self.mutex.get_mut().unwrap().0 == ptr_local + 1);
 
                 addr_of_mut!((*self.inline.get())[ptr_local])
                     .as_mut()
@@ -187,7 +191,7 @@ impl<T, const N: usize> Lineage<T, N> {
 
             if N > 0 {
                 debug_assert!(*inline_len > 0);
-                debug_assert!(*inline_len < N);
+                debug_assert!(*inline_len <= N);
 
                 *head = None;
 
@@ -231,7 +235,7 @@ impl<T, const N: usize> Lineage<T, N> {
 
             if N > 0 {
                 debug_assert!(*inline_len > 0);
-                debug_assert!(*inline_len < N);
+                debug_assert!(*inline_len <= N);
 
                 let value = if let Some(unique) = head.take() {
                     unique.into_inner().value
@@ -269,7 +273,7 @@ impl<T, const N: usize> Lineage<T, N> {
                 unique.into_inner().value
             } else {
                 debug_assert!(*inline_len > 0);
-                debug_assert!(*inline_len < N);
+                debug_assert!(*inline_len <= N);
 
                 *inline_len -= 1;
                 inline[*inline_len].assume_init_read()
