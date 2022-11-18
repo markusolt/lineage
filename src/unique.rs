@@ -1,4 +1,4 @@
-use std::{fmt, marker::PhantomData, ptr::NonNull};
+use std::{fmt, marker::PhantomData, mem, ptr::NonNull};
 
 pub struct Unique<T> {
     ptr: NonNull<T>,
@@ -49,6 +49,10 @@ impl<T> Unique<T> {
     }
 
     pub fn into_inner(self) -> T {
-        unsafe { *Box::from_raw(self.ptr.as_ptr()) }
+        unsafe {
+            let ret = *Box::from_raw(self.ptr.as_ptr());
+            mem::forget(self);
+            ret
+        }
     }
 }
