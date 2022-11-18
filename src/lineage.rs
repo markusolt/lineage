@@ -30,18 +30,24 @@ pub struct Lineage<T, const N: usize = 1> {
 impl<T, const N: usize> Drop for Lineage<T, N> {
     fn drop(&mut self) {
         unsafe {
-            let (inline_len, _) = &mut self.mutex.get_mut().unwrap();
-            let inline = self.inline.get_mut();
+            if let Ok(mut lock) = self.mutex.get_mut() {
+                let (inline_len, _) = &mut lock;
 
-            if N > 0 {
-                debug_assert!(*inline_len > 0);
+                let inline = self.inline.get_mut();
 
-                for i in 0..*inline_len {
-                    inline[i].assume_init_drop();
+                if N > 0 {
+                    debug_assert!(*inline_len > 0);
+
+                    for i in 0..*inline_len {
+                        inline[i].assume_init_drop();
+                    }
+                    *inline_len = 0;
+                } else {
+                    debug_assert!(*inline_len == N);
                 }
-                *inline_len = 0;
             } else {
-                //
+                // the mutex is poisened. there is no way to know how much of the inline storage
+                // is used, we have no choice but to leak everything stored inline.
             }
         }
     }
