@@ -40,10 +40,6 @@ impl<T> Unique<T> {
         unsafe { self.ptr.as_ref() }
     }
 
-    pub fn get_mut(&mut self) -> &mut T {
-        unsafe { self.ptr.as_mut() }
-    }
-
     pub fn get_ptr(&self) -> *mut T {
         self.ptr.as_ptr()
     }
