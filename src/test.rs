@@ -3,6 +3,11 @@ use std::{sync::Arc, thread, time::Duration};
 
 #[test]
 fn t001() {
+    let _: Lineage<String> = Lineage::new("t001".into());
+}
+
+#[test]
+fn t002() {
     let mut l: Lineage<String> = Lineage::new("1".into());
 
     let v1 = l.get();
@@ -30,30 +35,25 @@ fn t001() {
 }
 
 #[test]
-fn t002() {
-    let l: Arc<Lineage<String>> = Arc::new(Lineage::new("1".into()));
+fn t003() {
+    let mut l: Lineage<usize> = Lineage::new(5);
+    assert!(*l.get_mut() == 5);
+}
 
-    let mut threads = Vec::new();
-    for _ in 0..10 {
-        let l = Arc::clone(&l);
-        threads.push(thread::spawn(move || {
-            for _ in 0..10 {
-                thread::sleep(Duration::from_millis(1));
+#[test]
+fn t004() {
+    for i in 0..4 {
+        let l: Lineage<String> = Lineage::new("0".into());
+        for j in 0..i {
+            l.set(format!("{}", j + 1));
+        }
 
-                for _ in 0..10 {
-                    l.set(l.get().clone());
-                }
-            }
-        }));
-    }
-
-    for t in threads {
-        let _ = t.join();
+        l.into_inner();
     }
 }
 
 #[test]
-fn t003() {
+fn t005() {
     let mut l: Lineage<usize> = Lineage::new(0);
 
     for i in 0..10 {
@@ -74,13 +74,25 @@ fn t003() {
 }
 
 #[test]
-fn t004() {
-    for i in 0..4 {
-        let l: Lineage<String> = Lineage::new("0".into());
-        for j in 0..i {
-            l.set(format!("{}", j + 1));
-        }
+fn t006() {
+    let l: Arc<Lineage<String>> = Arc::new(Lineage::new("t006".into()));
 
-        l.into_inner();
+    let mut threads = Vec::new();
+    for _ in 0..10 {
+        let l = Arc::clone(&l);
+        threads.push(thread::spawn(move || {
+            for _ in 0..10 {
+                thread::sleep(Duration::from_millis(1));
+
+                for _ in 0..10 {
+                    let val = l.get().clone();
+                    l.set(val);
+                }
+            }
+        }));
+    }
+
+    for t in threads {
+        let _ = t.join();
     }
 }

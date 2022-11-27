@@ -1,18 +1,29 @@
-use crate::Unique;
 use std::{
-    fmt, ptr, ptr::addr_of_mut, sync::atomic::AtomicPtr, sync::atomic::Ordering::Acquire,
-    sync::atomic::Ordering::Release, sync::Mutex,
+    fmt, mem, ptr, ptr::NonNull, sync::atomic::AtomicPtr, sync::atomic::Ordering::Acquire,
+    sync::atomic::Ordering::Relaxed, sync::atomic::Ordering::SeqCst,
 };
 
-#[cold]
-fn panic_poisened_mutex<T, E>(_: E) -> T {
-    panic!("poisened mutex");
+struct AtomicLinkedList<T> {
+    head: AtomicPtr<Node<T>>,
+}
+
+impl<T> Drop for AtomicLinkedList<T> {
+    fn drop(&mut self) {
+        unsafe {
+            let mut cur = NonNull::new(*self.head.get_mut());
+            while let Some(ptr) = cur {
+                let Node { value, next } = *Box::from_raw(ptr.as_ptr());
+
+                mem::drop(value);
+                cur = next;
+            }
+        }
+    }
 }
 
 struct Node<T> {
     value: T,
-    #[allow(unused)]
-    prev: Option<Unique<Node<T>>>,
+    next: Option<NonNull<Node<T>>>,
 }
 
 /// A type of cell that allows replacing the contained value without invalidating references to
@@ -20,8 +31,7 @@ struct Node<T> {
 #[derive()]
 pub struct Lineage<T> {
     inline: T,
-    ptr_heap: AtomicPtr<T>,
-    head: Mutex<Option<Unique<Node<T>>>>,
+    list: AtomicLinkedList<T>,
 }
 
 unsafe impl<T> Send for Lineage<T> where T: Send {}
@@ -42,14 +52,22 @@ impl<T> Lineage<T> {
     pub fn new(value: T) -> Self {
         Lineage {
             inline: value,
-            ptr_heap: AtomicPtr::new(ptr::null_mut()),
-            head: Mutex::new(None),
+            list: AtomicLinkedList {
+                head: AtomicPtr::new(ptr::null_mut()),
+            },
         }
     }
 
     /// Get a reference to the current value.
     pub fn get(&self) -> &T {
-        unsafe { self.ptr_heap.load(Acquire).as_ref().unwrap_or(&self.inline) }
+        unsafe {
+            self.list
+                .head
+                .load(Acquire)
+                .as_ref()
+                .map(|node| &node.value)
+                .unwrap_or(&self.inline)
+        }
     }
 
     /// Get a mutable reference to the current value.
@@ -57,21 +75,12 @@ impl<T> Lineage<T> {
     /// Performs better than [`get`][Lineage::get] but requires `&mut self`.
     pub fn get_mut(&mut self) -> &mut T {
         unsafe {
-            let ptr = *self.ptr_heap.get_mut();
-
-            debug_assert!({
-                if let Ok(head) = self.head.get_mut() {
-                    head.as_mut()
-                        .map(|unique| addr_of_mut!((*unique.get_ptr()).value))
-                        .unwrap_or(ptr::null_mut())
-                        == ptr
-                } else {
-                    // poisened mutex
-                    true
-                }
-            });
-
-            ptr.as_mut().unwrap_or(&mut self.inline)
+            self.list
+                .head
+                .get_mut()
+                .as_mut()
+                .map(|node| &mut node.value)
+                .unwrap_or(&mut self.inline)
         }
     }
 
@@ -81,20 +90,24 @@ impl<T> Lineage<T> {
     /// value is kept alive until you call [`clear`][Lineage::clear] or drop the `Lineage`.
     pub fn set(&self, value: T) {
         unsafe {
-            let mut lock = self.head.lock().unwrap_or_else(panic_poisened_mutex);
-            let head: &mut Option<Unique<Node<T>>> = &mut lock;
-
-            debug_assert!(head.is_none() == self.ptr_heap.load(Acquire).is_null());
-
-            *head = Some(Unique::new(Node {
+            let mut next = self.list.head.load(Acquire);
+            let mut node = NonNull::new_unchecked(Box::into_raw(Box::new(Node {
                 value,
-                prev: head.take(),
-            }));
+                next: NonNull::new(next),
+            })));
 
-            self.ptr_heap.store(
-                addr_of_mut!((*head.as_ref().unwrap_unchecked().get_ptr()).value),
-                Release,
-            );
+            while let Err(err) =
+                self.list
+                    .head
+                    .compare_exchange_weak(next, node.as_ptr(), SeqCst, Relaxed)
+            {
+                if next != err {
+                    debug_assert!(!err.is_null());
+
+                    next = err;
+                    node.as_mut().next = Some(NonNull::new_unchecked(next));
+                }
+            }
         }
     }
 
@@ -103,12 +116,14 @@ impl<T> Lineage<T> {
     /// Performs better than [`set`][Lineage::set] but requires `&mut self`. Also drops old values
     /// similar to [`clear`][Lineage::clear].
     pub fn set_mut(&mut self, value: T) {
-        let head = self.head.get_mut().unwrap_or_else(panic_poisened_mutex);
+        let ptr = *self.list.head.get_mut();
+        if !ptr.is_null() {
+            *self.list.head.get_mut() = ptr::null_mut();
 
-        debug_assert!(head.is_none() == self.ptr_heap.get_mut().is_null());
-
-        *head = None;
-        *self.ptr_heap.get_mut() = ptr::null_mut();
+            mem::drop(AtomicLinkedList {
+                head: AtomicPtr::new(ptr),
+            });
+        }
 
         self.inline = value;
     }
@@ -118,26 +133,38 @@ impl<T> Lineage<T> {
     /// This can only be called if no references to any of the previous values exist anymore. This is
     /// ensured by the `&mut self` requirement.
     pub fn clear(&mut self) {
-        let head = self.head.get_mut().unwrap_or_else(panic_poisened_mutex);
-
-        if let Some(head) = head.take() {
-            debug_assert!(!self.ptr_heap.get_mut().is_null());
-
-            self.inline = head.into_inner().value;
-            *self.ptr_heap.get_mut() = ptr::null_mut();
+        if let Some(value) = self.pop_and_clear() {
+            self.inline = value;
         }
-
-        debug_assert!(head.is_none());
-        debug_assert!(self.ptr_heap.get_mut().is_null());
     }
 
     /// Return ownership of the current value.
     pub fn into_inner(mut self) -> T {
-        let head = self.head.get_mut().unwrap_or_else(panic_poisened_mutex);
+        if let Some(value) = self.pop_and_clear() {
+            value
+        } else {
+            self.inline
+        }
+    }
 
-        head.take()
-            .map(|unique| unique.into_inner().value)
-            .unwrap_or(self.inline)
+    fn pop_and_clear(&mut self) -> Option<T> {
+        unsafe {
+            let ptr = *self.list.head.get_mut();
+            if ptr.is_null() {
+                return None;
+            } else {
+                let Node { value, next } = *Box::from_raw(ptr);
+                *self.list.head.get_mut() = ptr::null_mut();
+
+                if let Some(ptr) = next {
+                    mem::drop(AtomicLinkedList {
+                        head: AtomicPtr::new(ptr.as_ptr()),
+                    });
+                }
+
+                Some(value)
+            }
+        }
     }
 }
 

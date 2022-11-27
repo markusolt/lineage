@@ -7,10 +7,8 @@
 //! value is stored inline within the `Lineage`. Only calling [`Lineage::set`] causes a heap allocation.
 
 mod lineage;
-mod unique;
 
 pub use crate::lineage::Lineage;
-pub(crate) use unique::Unique;
 
 #[cfg(test)]
 mod test;
