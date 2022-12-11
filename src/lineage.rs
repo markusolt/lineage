@@ -48,7 +48,7 @@ where
 }
 
 impl<T> Lineage<T> {
-    /// Create a new `Lineage` with the provided value.
+    /// Creates a new `Lineage` with the provided value.
     pub fn new(value: T) -> Self {
         Lineage {
             inline: value,
@@ -58,7 +58,7 @@ impl<T> Lineage<T> {
         }
     }
 
-    /// Get a reference to the current value.
+    /// Gets a reference to the current value.
     pub fn get(&self) -> &T {
         unsafe {
             self.list
@@ -70,7 +70,7 @@ impl<T> Lineage<T> {
         }
     }
 
-    /// Get a mutable reference to the current value.
+    /// Gets a mutable reference to the current value.
     ///
     /// Performs better than [`get`][Lineage::get] but requires `&mut self`.
     pub fn get_mut(&mut self) -> &mut T {
@@ -84,10 +84,11 @@ impl<T> Lineage<T> {
         }
     }
 
-    /// Replace the value.
+    /// Replaces the value.
     ///
     /// Replacing the value does not invalidate existing references to the previous value. The previous
-    /// value is kept alive until you call [`clear`][Lineage::clear] or drop the `Lineage`.
+    /// value is kept alive until you call [`clear`][Lineage::clear] or drop the `Lineage`. The new value
+    /// is stored in a [`Box`] which causes a heap allocation.
     pub fn set(&self, value: T) {
         unsafe {
             let mut next = self.list.head.load(Acquire);
@@ -111,10 +112,18 @@ impl<T> Lineage<T> {
         }
     }
 
-    /// Replace the value.
+    /// Replaces the value.
     ///
-    /// Performs better than [`set`][Lineage::set] but requires `&mut self`. Also drops old values
-    /// similar to [`clear`][Lineage::clear].
+    /// Performs much better than [`set`][Lineage::set] but requires `&mut self`. The implementation
+    /// is a more optimized version of the following code:
+    ///
+    /// ```
+    /// # use lineage::Lineage;
+    /// fn set_mut<T>(lineage: &mut Lineage<T>, value: T) {
+    ///     lineage.clear();
+    ///     *lineage.get_mut() = value;
+    /// }
+    /// ```
     pub fn set_mut(&mut self, value: T) {
         let ptr = *self.list.head.get_mut();
         if !ptr.is_null() {
@@ -128,17 +137,18 @@ impl<T> Lineage<T> {
         self.inline = value;
     }
 
-    /// Drop all past values. Does not affect the current value.
+    /// Drops all past values. Does not affect the current value.
     ///
     /// This can only be called if no references to any of the previous values exist anymore. This is
-    /// ensured by the `&mut self` requirement.
+    /// ensured by the `&mut self` requirement. Should be called as often as possible to avoid having
+    /// many past values kept alive unnecessarily.
     pub fn clear(&mut self) {
         if let Some(value) = self.pop_and_clear() {
             self.inline = value;
         }
     }
 
-    /// Return ownership of the current value.
+    /// Returns ownership of the current value.
     pub fn into_inner(mut self) -> T {
         if let Some(value) = self.pop_and_clear() {
             value
