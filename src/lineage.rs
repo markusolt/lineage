@@ -53,7 +53,7 @@ struct Node<T> {
 }
 
 /// A type of cell that allows replacing the contained value without invalidating references to
-/// previous values.
+/// the current value.
 #[derive()]
 pub struct Lineage<T> {
     inline: T,
