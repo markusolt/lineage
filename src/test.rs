@@ -96,3 +96,39 @@ fn t006() {
         let _ = t.join();
     }
 }
+
+#[test]
+fn t007() {
+    const LEN: usize = 10;
+
+    for i in 0..=LEN {
+        let mut l: Lineage<String> = Lineage::new(0.to_string());
+        for j in 0..LEN {
+            l.set((j + 1).to_string());
+        }
+
+        let mut drain = l.drain();
+
+        for j in 0..i {
+            assert!(drain.size_hint().0 <= LEN - j);
+            assert!(drain
+                .size_hint()
+                .1
+                .map(|est| est >= LEN - j)
+                .unwrap_or(true));
+
+            assert!(drain.next() == Some((LEN - 1 - j).to_string()));
+        }
+
+        assert!(drain.size_hint().0 <= LEN - i);
+        assert!(drain
+            .size_hint()
+            .1
+            .map(|est| est >= LEN - i)
+            .unwrap_or(true));
+
+        if i == LEN {
+            assert!(drain.next().is_none());
+        }
+    }
+}
