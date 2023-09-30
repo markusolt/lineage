@@ -3,18 +3,20 @@
 A small rust crate that provides a type of cell that can replace its contained value while the previous value is still immutably borrowed:
 
 ```rust
-pub fn new(value: T) -> Self { }
+impl Lineage {
+    pub fn new(value: T) -> Self;
 
-pub fn get(&self) -> &T { }
+    pub fn get(&self) -> &T;
 
-pub fn set(&self, value: T) { }
+    pub fn set(&self, value: T);
 
-pub fn clear(&mut self) { }
+    pub fn clear(&mut self);
+}
 ```
 
-Notice how a new value can be inserted into the cell with `set` using only `&self`.
-This means the `Lineage` may still be borrowed by previous calls to `get` but you can replace the contained value anyways.
-Internally the replaced value is added to a linked list which is not cleared until you call `clear` or drop the `Lineage`.
+Notice how a new value can be inserted into the cell with `Lineage::set` using only `&self`.
+This means the `Lineage` may still be borrowed by previous calls to `Lineage::get` but you can replace the contained value anyways.
+Internally the replaced value is added to a linked list which is not cleared until you call `Lineage::clear` or drop the `Lineage`.
 
 ```rust
 let lineage: Lineage<String> = Lineage::new(String::from("ONE"));

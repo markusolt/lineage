@@ -1,6 +1,14 @@
 [package]
 name = "lineage"
 version = "0.4.0"
+authors = ["Markus Olt <markus@blaumond.net>"]
 edition = "2021"
+license = "MIT"
+
+description = "A cell to replace the contained value while it may still be borrowed."
+documentation = "https://docs.rs/lineage"
+repository = "https://github.com/markusolt/lineage"
+readme = "readme.md"
+keywords = []
 
 [dependencies]
